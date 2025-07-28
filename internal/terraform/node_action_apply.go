@@ -8,8 +8,10 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/terraform/internal/actions"
 	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/dag"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/providers"
@@ -39,37 +41,15 @@ func (n *nodeActionApply) DotNode(string, *dag.DotOpts) *dag.DotNode {
 }
 
 func (n *nodeActionApply) Execute(ctx EvalContext, _ walkOperation) tfdiags.Diagnostics {
-	finishedActionInvocations, diags := invokeActions(ctx, n.ActionInvocations)
-	if diags.HasErrors() {
-		// Since the actions running after the resource apply have failed, we want to give the user
-		// directions on how to recover from this. In this case we want to give the user a list of
-		// actions to re-run using the `terraform invoke` command.
-
-		// Since the actions are run in order, we can remove however many actions we have already
-		// run from the list of action invocations.
-		numberOfMissingActions := len(n.ActionInvocations) - len(finishedActionInvocations)
-		// This should always be the case, but we check just to be sure.
-		if numberOfMissingActions > 0 {
-			// We want to give the user a list of actions to re-run.
-			actionsToReRun := []string{}
-			for _, invocation := range n.ActionInvocations[:numberOfMissingActions] {
-				actionsToReRun = append(actionsToReRun, fmt.Sprintf("  - %s", invocation.Addr.String()))
-			}
-
-			diags = diags.Append(tfdiags.Sourceless(
-				tfdiags.Error,
-				fmt.Sprintf("Actions failed for %s", n.TriggeringResourceaddrs),
-				fmt.Sprintf(
-					"The following actions failed: \n%s\nYou can re-run them using the `terraform invoke <action address>` command.",
-					strings.Join(actionsToReRun, "\n"),
-				),
-			))
-		}
-	}
-	return diags
+	return invokeActions(ctx, n.TriggeringResourceaddrs, n.ActionInvocations)
 }
 
-func invokeActions(ctx EvalContext, actionInvocations []*plans.ActionInvocationInstance) ([]*plans.ActionInvocationInstance, tfdiags.Diagnostics) {
+func invokeActions(ctx EvalContext, triggeringResourceAddrs addrs.AbsResourceInstance, actionInvocations []*plans.ActionInvocationInstance) tfdiags.Diagnostics {
+	finishedActionInvocations, diags := processActionInvocations(ctx, actionInvocations)
+	return betterDiags(triggeringResourceAddrs, finishedActionInvocations, actionInvocations, diags)
+}
+
+func processActionInvocations(ctx EvalContext, actionInvocations []*plans.ActionInvocationInstance) ([]*plans.ActionInvocationInstance, tfdiags.Diagnostics) {
 	var finishedActionInvocations []*plans.ActionInvocationInstance
 	var diags tfdiags.Diagnostics
 	// First we order the action invocations by their trigger block index and events list index.
@@ -192,4 +172,84 @@ func (n *nodeActionApply) ActionProviders() []addrs.AbsProviderConfig {
 		ret = append(ret, invocation.ProviderAddr)
 	}
 	return ret
+}
+
+func betterDiags(triggeringResourceAddrs addrs.AbsResourceInstance, finishedActionInvocations, allActionInvocations []*plans.ActionInvocationInstance, diags tfdiags.Diagnostics) tfdiags.Diagnostics {
+	// If everything went well, we can return the diagnostics as is.
+	if !diags.HasErrors() {
+		return diags
+	}
+
+	// Something went wrong, the user might need to take action so that
+	// - the actions that failed or that were not executed can be retried
+	// - the user can undo side-effects of actions that were executed successfully before the
+	//   failure and will be re-run in the next apply.
+
+	if areBeforeActionInvocations(allActionInvocations) {
+		// Before actions need to let the user know that they will be re-run in the next apply
+		alreadyRunActions := []string{}
+		for _, ai := range finishedActionInvocations {
+			alreadyRunActions = append(alreadyRunActions, fmt.Sprintf("- %s", ai.Addr))
+		}
+
+		return tfdiags.Diagnostics{}.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  fmt.Sprintf("Failed to apply actions before %s", triggeringResourceAddrs),
+			Detail: fmt.Sprintf(
+				`An error occured while invoking actions: %s
+				
+The following actions were successfully invoked:
+%s
+
+As the resource did not change, these actions will be re-invoked in the next apply.`,
+				diags.ErrWithWarnings(),
+				strings.Join(alreadyRunActions, "\n"),
+			),
+			// TODO: Add subject (source addrs range needs to be in action invocation?)
+		})
+	} else {
+		missingActionInvocations := allActionInvocations[len(finishedActionInvocations):]
+		missingActions := []string{}
+		for _, ai := range missingActionInvocations {
+			missingActions = append(missingActions, fmt.Sprintf("- %s", ai.Addr))
+		}
+
+		return tfdiags.Diagnostics{}.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  fmt.Sprintf("Failed to apply actions after %s", triggeringResourceAddrs),
+			Detail: fmt.Sprintf(
+				`An error occured while invoking actions: %s
+				
+The following actions were not yet invoked:
+%s
+
+These actions will not be triggered in the next apply, please run "terraform invoke" to invoke them.`,
+				diags.ErrWithWarnings(),
+				strings.Join(missingActions, "\n"),
+			),
+			// TODO: Add subject (source addrs range needs to be in action invocation?)
+		})
+	}
+
+}
+
+// areBeforeActionInvocations checks if all action invocations are for before actions.
+// It panics if the action invocations are empty or if they have different trigger events.
+func areBeforeActionInvocations(actionInvocations []*plans.ActionInvocationInstance) bool {
+	if len(actionInvocations) == 0 {
+		panic("areBeforeActionInvocations called with empty actionInvocations")
+	}
+	firstEvent := actionInvocations[0].TriggerEvent
+	for _, ai := range actionInvocations {
+		if ai.TriggerEvent != firstEvent {
+			panic(fmt.Sprintf("areBeforeActionInvocations called with action invocations with different trigger events: %s != %s", firstEvent, ai.TriggerEvent))
+		}
+	}
+
+	switch firstEvent {
+	case configs.BeforeCreate, configs.BeforeUpdate, configs.BeforeDestroy:
+		return true
+	default:
+		return false
+	}
 }
